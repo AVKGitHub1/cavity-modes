@@ -4,12 +4,11 @@ from matplotlib.widgets import Slider
 from numpy.polynomial.hermite import hermval
 import math
 import logging
-
-#set up logging
+#setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
+from config import CONFIG  # import all tunable parameters
 
 ###############################################################################
 # Physics helpers
@@ -19,7 +18,7 @@ def symmetric_cavity_mode(R, L, lam):
     """
     Symmetric two-mirror cavity: both mirrors have ROC = R, separated by L.
     Returns:
-        g    : g-parameter (symmetric, so g1 = g2 = g)
+        g    : g-parameter
         z_R  : Rayleigh range
         w0   : waist at cavity center
         z_m  : distance from waist to each mirror (L/2)
@@ -29,7 +28,7 @@ def symmetric_cavity_mode(R, L, lam):
     g = 1.0 - L / R
 
     if not (0 < g < 1):
-        logger.warning("Cavity may be unstable (g={:.3f})".format(g))
+        logger.warning("Warning: cavity may be unstable (g={:.3f})".format(g))
 
     z_R = (L / 2.0) * np.sqrt((1 + g) / (1 - g))
     w0  = np.sqrt(lam * z_R / np.pi)
@@ -74,13 +73,11 @@ def hg_mode(x, y, n, m, w, Rb, lam):
     xi  = np.sqrt(2) * X / w
     eta = np.sqrt(2) * Y / w
 
-    # Physicists' Hermite polynomials H_n, H_m
     coeffs_n = [0] * n + [1]
     coeffs_m = [0] * m + [1]
     Hn = hermval(xi,  coeffs_n)
     Hm = hermval(eta, coeffs_m)
 
-    # Normalization prefactor
     pref = (np.sqrt(2/np.pi) / w) / np.sqrt((2.0**(n+m)) * math.factorial(n) * math.factorial(m))
 
     envelope = np.exp(-r2 / w**2)
@@ -125,7 +122,6 @@ def simulate_cavity_camera_pd(
     Nscan,
     scan_range_lambda,
     Nmax,
-    camera_index="max",
 ):
     """
     Nondegenerate symmetric cavity with HG_nm modes up to Nmax.
@@ -144,7 +140,7 @@ def simulate_cavity_camera_pd(
     # Gouy phase per half round trip
     zeta = np.arccos(g)   # radians
 
-    # Grid for mode expansion and camera
+    # Grid
     w_max = max(w_m, w0_in)
     half_size = FOV_factor * w_max
     x = np.linspace(-half_size, half_size, Npix)
@@ -168,11 +164,10 @@ def simulate_cavity_camera_pd(
             c_nm = mode_overlap(E_nm, E_in, dx, dy)
             coeffs[(n, m)] = c_nm
             modes[(n, m)]  = E_nm
-            # nondegenerate resonance length shift
             dL_nm[(n, m)]  = -(n + m) * zeta / k
             eta_total += np.abs(c_nm)**2
 
-    # Mirrors
+    # Mirror coefficients
     r1 = np.sqrt(Rmirror)
     r2 = np.sqrt(Rmirror)
     t1 = np.sqrt(1 - Rmirror)
@@ -192,20 +187,20 @@ def simulate_cavity_camera_pd(
         H_nm_dict[(n, m)] = H_nm
         pd_signal += np.abs(c_nm)**2 * np.abs(H_nm)**2
 
-    # Choose index for camera
-    if camera_index == "max":
-        idx_cam = int(np.argmax(pd_signal))
-    else:
-        idx_cam = int(camera_index)
-        idx_cam = max(0, min(idx_cam, len(dL)-1))
+    # --- FAST-DITHER CAMERA: TIME-AVERAGED INTENSITY ---
 
-    # Camera field at that dL
-    E_cam = np.zeros_like(X, dtype=complex)
-    for (n, m), c_nm in coeffs.items():
-        h_nm = H_nm_dict[(n, m)][idx_cam]
-        E_cam += c_nm * h_nm * modes[(n, m)]
+    camera_img = np.zeros_like(X, dtype=float)
 
-    camera_img = np.abs(E_cam)**2
+    for i in range(len(dL)):
+        E_inst = np.zeros_like(X, dtype=complex)
+
+        for (n, m), c_nm in coeffs.items():
+            h_nm = H_nm_dict[(n, m)][i]
+            E_inst += c_nm * h_nm * modes[(n, m)]
+
+        camera_img += np.abs(E_inst)**2
+
+    camera_img /= len(dL)   # time average
 
     return dL, pd_signal, camera_img, x, y
 
@@ -214,24 +209,25 @@ def simulate_cavity_camera_pd(
 ###############################################################################
 
 if __name__ == "__main__":
-    # Fixed physical parameters (tweak if you want)
-    R       = 0.5        # ROC [m]
-    L       = 0.05       # cavity length [m]
-    w0_in   = 0.3e-3     # input beam radius at mirror [m]
-    Rb_in   = np.inf     # collimated input beam at mirror
-    lam     = 780e-9     # wavelength [m]
-    Rmirror = 0.995      # mirror intensity reflectivity
-    Npix    = 128        # grid size for camera
-    FOV_factor     = 4.0
-    Nscan          = 600
+    # Unpack config
+    R       = CONFIG["R"]
+    L       = CONFIG["L"]
+    w0_in   = CONFIG["w0_in"]
+    Rb_in   = CONFIG["Rb_in"]
+    lam     = CONFIG["lam"]
+    Rmirror = CONFIG["Rmirror"]
+    Npix    = CONFIG["Npix"]
+    FOV_factor = CONFIG["FOV_factor"]
+    Nscan   = CONFIG["Nscan"]
 
-    # Initial slider values
-    init_x_off_um        = 0   # µm
-    init_y_off_um        = 0   # µm
-    init_scan_range_lam  = 4.0      # in units of λ
-    init_Nmax            = 10
+    init_x_off_um       = CONFIG["init_x_off_um"]
+    init_y_off_um       = CONFIG["init_y_off_um"]
+    init_scan_range_lam = CONFIG["init_scan_range_lam"]
+    init_Nmax           = CONFIG["init_Nmax"]
 
-    # Run initial simulation
+    slider_ranges = CONFIG["slider_ranges"]
+
+    # Initial simulation
     dL, pd_signal, camera_img, x, y = simulate_cavity_camera_pd(
         R=R,
         L=L,
@@ -245,15 +241,13 @@ if __name__ == "__main__":
         FOV_factor=FOV_factor,
         Nscan=Nscan,
         scan_range_lambda=init_scan_range_lam,
-        Nmax=init_Nmax,
-        camera_index="max",
+        Nmax=init_Nmax
     )
 
-    # Set up figure with 2 subplots: left = camera, right = PD
+    # Figure with camera + PD
     fig, (ax_cam, ax_pd) = plt.subplots(1, 2, figsize=(10, 4))
     plt.subplots_adjust(left=0.1, right=0.95, bottom=0.25, wspace=0.35)
 
-    # Camera plot
     extent = [x[0]*1e3, x[-1]*1e3, y[0]*1e3, y[-1]*1e3]  # mm
     im = ax_cam.imshow(
         camera_img,
@@ -267,7 +261,6 @@ if __name__ == "__main__":
     cbar = fig.colorbar(im, ax=ax_cam)
     cbar.set_label("Intensity (arb. units)")
 
-    # PD plot
     line_pd, = ax_pd.plot(dL * 1e9, pd_signal)
     ax_pd.set_xlabel("Cavity length change dL [nm]")
     ax_pd.set_ylabel("PD signal (arb. units)")
@@ -276,25 +269,48 @@ if __name__ == "__main__":
 
     # Slider axes
     axcolor = "lightgoldenrodyellow"
-    ax_xoff   = fig.add_axes([0.15, 0.17, 0.7, 0.03], facecolor=axcolor)
-    ax_yoff   = fig.add_axes([0.15, 0.12, 0.7, 0.03], facecolor=axcolor)
-    ax_scan   = fig.add_axes([0.15, 0.07, 0.7, 0.03], facecolor=axcolor)
-    ax_Nmax   = fig.add_axes([0.15, 0.02, 0.7, 0.03], facecolor=axcolor)
+    ax_xoff = fig.add_axes([0.15, 0.17, 0.7, 0.03], facecolor=axcolor)
+    ax_yoff = fig.add_axes([0.15, 0.12, 0.7, 0.03], facecolor=axcolor)
+    ax_scan = fig.add_axes([0.15, 0.07, 0.7, 0.03], facecolor=axcolor)
+    ax_Nmax = fig.add_axes([0.15, 0.02, 0.7, 0.03], facecolor=axcolor)
 
-    # Sliders
-    s_xoff = Slider(ax_xoff, 'x_off [µm]', -500.0, 500.0, valinit=init_x_off_um)
-    s_yoff = Slider(ax_yoff, 'y_off [µm]', -500.0, 500.0, valinit=init_y_off_um)
-    s_scan = Slider(ax_scan, 'scan_range [λ]', 1.0, 10.0, valinit=init_scan_range_lam)
-    s_Nmax = Slider(ax_Nmax, 'Nmax', 5, 15, valinit=init_Nmax, valstep=1.0)
+    # Slider objects (ranges from config)
+    s_xoff = Slider(
+        ax_xoff,
+        'x_off [µm]',
+        slider_ranges["x_off_um"]["min"],
+        slider_ranges["x_off_um"]["max"],
+        valinit=init_x_off_um,
+    )
+    s_yoff = Slider(
+        ax_yoff,
+        'y_off [µm]',
+        slider_ranges["y_off_um"]["min"],
+        slider_ranges["y_off_um"]["max"],
+        valinit=init_y_off_um,
+    )
+    s_scan = Slider(
+        ax_scan,
+        'scan_range [λ]',
+        slider_ranges["scan_range"]["min"],
+        slider_ranges["scan_range"]["max"],
+        valinit=init_scan_range_lam,
+    )
+    s_Nmax = Slider(
+        ax_Nmax,
+        'Nmax',
+        slider_ranges["Nmax"]["min"],
+        slider_ranges["Nmax"]["max"],
+        valinit=init_Nmax,
+        valstep=1.0,
+    )
 
     def update(val):
-        # Get slider values
         x_off_um = s_xoff.val
         y_off_um = s_yoff.val
         scan_range_lambda = s_scan.val
         Nmax_int = int(s_Nmax.val)
 
-        # Re-run simulation with new parameters
         dL_new, pd_new, cam_new, x_new, y_new = simulate_cavity_camera_pd(
             R=R,
             L=L,
@@ -308,23 +324,19 @@ if __name__ == "__main__":
             FOV_factor=FOV_factor,
             Nscan=Nscan,
             scan_range_lambda=scan_range_lambda,
-            Nmax=Nmax_int,
-            camera_index="max",
+            Nmax=Nmax_int
         )
 
-        # Update PD plot
         line_pd.set_xdata(dL_new * 1e9)
         line_pd.set_ydata(pd_new)
         ax_pd.relim()
         ax_pd.autoscale_view()
 
-        # Update camera
         im.set_data(cam_new)
         im.set_clim(vmin=cam_new.min(), vmax=cam_new.max())
 
         fig.canvas.draw_idle()
 
-    # Connect sliders to update
     s_xoff.on_changed(update)
     s_yoff.on_changed(update)
     s_scan.on_changed(update)
