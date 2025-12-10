@@ -10,6 +10,10 @@ logger = logging.getLogger(__name__)
 
 from config import CONFIG  # import all tunable parameters
 
+
+# Global cache for HG modes & grid
+_HG_CACHE = {}
+
 ###############################################################################
 # Physics helpers
 ###############################################################################
@@ -38,6 +42,88 @@ def symmetric_cavity_mode(R, L, lam):
     R_m = z_m * (1 + (z_R**2 / z_m**2))
 
     return g, z_R, w0, z_m, w_m, R_m
+
+def gaussian_field_1d(x, w, Rb, lam, x0=0.0):
+    """
+    1D complex Gaussian field at a given plane.
+    Normalized so ∫|E|^2 dx ~ 1 if you integrate over a big enough range.
+    """
+    k = 2 * np.pi / lam
+    X = x - x0
+
+    amp = (1.0 / (np.pi**0.25 * np.sqrt(w)))  # 1D HG00-like normalization
+    envelope = np.exp(-(X**2) / (w**2))
+
+    if np.isinf(Rb):
+        phase = np.ones_like(envelope, dtype=complex)
+    else:
+        phase = np.exp(-1j * k * X**2 / (2 * Rb))
+
+    return amp * envelope * phase
+
+def get_grid_and_1d_modes(R, L, lam, w0_in, Npix, FOV_factor, Nmax):
+    """
+    Return (from cache if possible):
+
+        x, y        : 1D grids [m]
+        u_nx        : array [Nn, Nx]  1D HG_n(x)
+        u_my        : array [Nm, Ny]  1D HG_m(y)
+        dx, dy      : grid spacings
+        g, z_R, w0_cav, z_m, w_m, R_m : cavity mode params
+    """
+    key = (R, L, lam, w0_in, Npix, FOV_factor, Nmax)
+    if key in _HG_CACHE:
+        return _HG_CACHE[key]
+
+    # Cavity mode at mirrors
+    g, z_R, w0_cav, z_m, w_m, R_m = symmetric_cavity_mode(R, L, lam)
+    k = 2 * np.pi / lam
+
+    # Grid extent: based on larger of cavity spot and input beam
+    w_max = max(w_m, w0_in)
+    half_size = FOV_factor * w_max
+
+    x = np.linspace(-half_size, half_size, Npix)
+    y = np.linspace(-half_size, half_size, Npix)
+    dx = x[1] - x[0]
+    dy = y[1] - y[0]
+
+    # Dimensionless coordinates for HG modes
+    xi  = np.sqrt(2) * x / w_m
+    eta = np.sqrt(2) * y / w_m
+
+    # Common envelopes and phases (1D, separable)
+    env_x = np.exp(-(x**2) / (w_m**2))
+    env_y = np.exp(-(y**2) / (w_m**2))
+
+    if np.isinf(R_m):
+        phase_x = np.ones_like(x, dtype=complex)
+        phase_y = np.ones_like(y, dtype=complex)
+    else:
+        phase_x = np.exp(-1j * k * x**2 / (2 * R_m))
+        phase_y = np.exp(-1j * k * y**2 / (2 * R_m))
+
+    Nn = Nmax + 1
+    Nm = Nmax + 1
+    u_nx = np.zeros((Nn, Npix), dtype=complex)
+    u_my = np.zeros((Nm, Npix), dtype=complex)
+
+    # Build orthonormal 1D HG basis along x and y
+    for n in range(Nn):
+        coeffs_n = [0] * n + [1]
+        Hn_x = hermval(xi, coeffs_n)
+        pref_n = 1.0 / ( (2.0**n * math.factorial(n))**0.5 * (np.pi**0.25 * np.sqrt(w_m)) )
+        u_nx[n, :] = pref_n * Hn_x * env_x * phase_x
+
+    for m in range(Nm):
+        coeffs_m = [0] * m + [1]
+        Hm_y = hermval(eta, coeffs_m)
+        pref_m = 1.0 / ( (2.0**m * math.factorial(m))**0.5 * (np.pi**0.25 * np.sqrt(w_m)) )
+        u_my[m, :] = pref_m * Hm_y * env_y * phase_y
+
+    _HG_CACHE[key] = (x, y, u_nx, u_my, dx, dy, g, z_R, w0_cav, z_m, w_m, R_m)
+    return _HG_CACHE[key]
+
 
 def gaussian_field(x, y, w, Rb, lam, x0=0.0, y0=0.0):
     """
@@ -124,85 +210,114 @@ def simulate_cavity_camera_pd(
     Nmax,
 ):
     """
-    Nondegenerate symmetric cavity with HG_nm modes up to Nmax.
+    Nondegenerate symmetric cavity with HG_nm modes up to Nmax,
+    using cached 1D HG basis and 1D overlaps.
 
     Returns:
         dL         : cavity length change array [m]
         pd_signal  : PD signal vs dL (arb. units)
-        camera_img : 2D intensity at chosen dL
+        camera_img : 2D time-averaged intensity [fast-dither regime]
         x, y       : coordinate vectors [m]
     """
     k = 2 * np.pi / lam
 
-    # Cavity mode at mirrors
-    g, z_R, w0_cav, z_m, w_m, R_m = symmetric_cavity_mode(R, L, lam)
+    # Get grid and 1D HG basis from cache
+    (
+        x, y,
+        u_nx, u_my,
+        dx, dy,
+        g, z_R, w0_cav, z_m, w_m, R_m
+    ) = get_grid_and_1d_modes(R, L, lam, w0_in, Npix, FOV_factor, Nmax)
 
-    # Gouy phase per half round trip
-    zeta = np.arccos(g)   # radians
+    Nn = Nmax + 1
+    Nm = Nmax + 1
+    Nx = x.size
+    Ny = y.size
 
-    # Grid
-    w_max = max(w_m, w0_in)
-    half_size = FOV_factor * w_max
-    x = np.linspace(-half_size, half_size, Npix)
-    y = np.linspace(-half_size, half_size, Npix)
-    X, Y = np.meshgrid(x, y)
-    dx = x[1] - x[0]
-    dy = y[1] - y[0]
+    # Input field 1D along x and y
+    f_x = gaussian_field_1d(x, w0_in, Rb_in, lam, x0=x_off)
+    f_y = gaussian_field_1d(y, w0_in, Rb_in, lam, x0=y_off)
 
-    # Input field at mirror
-    E_in = gaussian_field(X, Y, w0_in, Rb_in, lam, x0=x_off, y0=y_off)
+    # 1D overlaps: alpha_n = <u_nx | f_x>, beta_m = <u_my | f_y>
+    alpha = np.zeros(Nn, dtype=complex)
+    beta  = np.zeros(Nm, dtype=complex)
 
-    # HG expansion
-    coeffs = {}
-    modes  = {}
-    dL_nm  = {}
-    eta_total = 0.0
+    for n in range(Nn):
+        alpha[n] = np.sum(np.conjugate(u_nx[n, :]) * f_x) * dx
+    for m in range(Nm):
+        beta[m]  = np.sum(np.conjugate(u_my[m, :]) * f_y) * dy
 
-    for n in range(Nmax+1):
-        for m in range(Nmax+1):
-            E_nm = hg_mode(X, Y, n, m, w_m, R_m, lam)
-            c_nm = mode_overlap(E_nm, E_in, dx, dy)
-            coeffs[(n, m)] = c_nm
-            modes[(n, m)]  = E_nm
-            dL_nm[(n, m)]  = -(n + m) * zeta / k
-            eta_total += np.abs(c_nm)**2
+    # 2D mode overlaps: c_nm = alpha_n * beta_m (separable input!)
+    # Flatten to a 1D list of modes
+    c_nm_2d = alpha[:, None] * beta[None, :]
+    Nmodes = Nn * Nm
 
-    # Mirror coefficients
+    c_nm = c_nm_2d.reshape(Nmodes)
+
+    # Build 2D HG modes (vectorized, via outer products of 1D basis)
+    # modes_nm[mode_index, j, k] = u_nx[n,k] * u_my[m,j]
+    modes_nm = np.zeros((Nmodes, Ny, Nx), dtype=complex)
+    mode_index = 0
+    for n in range(Nn):
+        for m in range(Nm):
+            # outer product: y-index (rows), x-index (cols)
+            modes_nm[mode_index, :, :] = np.outer(u_my[m, :], u_nx[n, :])
+            mode_index += 1
+
+    # Gouy phase and nondegenerate resonance shifts
+    zeta = np.arccos(g)  # Gouy per half round trip
+
+    # Indices n,m for each flat mode index
+    n_indices = np.repeat(np.arange(Nn), Nm)
+    m_indices = np.tile(np.arange(Nm), Nn)
+    order_sum = n_indices + m_indices
+
+    # Mode-specific resonance length shift ΔL_nm
+    deltaL_modes = -(order_sum.astype(float) * zeta / k)  # [Nmodes]
+
+    # Cavity length scan
+    dL = np.linspace(-scan_range_lambda * lam,
+                     +scan_range_lambda * lam, Nscan)  # [Nscan]
+
+    # Mirror amplitude coefficients
     r1 = np.sqrt(Rmirror)
     r2 = np.sqrt(Rmirror)
     t1 = np.sqrt(1 - Rmirror)
     t2 = np.sqrt(1 - Rmirror)
 
-    # Cavity length scan
-    dL = np.linspace(-scan_range_lambda * lam,
-                     +scan_range_lambda * lam, Nscan)
+    # Build array of detunings for each mode and scan point
+    # shape: [Nmodes, Nscan]
+    dL_matrix = dL[None, :] - deltaL_modes[:, None]
+    phi_nm = 2 * k * dL_matrix
 
-    pd_signal = np.zeros_like(dL, dtype=float)
-    H_nm_dict = {}
+    # Field transfer function for all modes and scan points
+    denom = 1 - r1 * r2 * np.exp(1j * phi_nm)
+    H_nm_scan = t1 * t2 * np.exp(1j * phi_nm / 2) / denom  # [Nmodes, Nscan]
 
-    for (n, m), c_nm in coeffs.items():
-        deltaL = dL - dL_nm[(n, m)]
-        phi_nm = 2 * k * deltaL
-        H_nm = cavity_transfer_function(phi_nm, r1, r2, t1, t2)
-        H_nm_dict[(n, m)] = H_nm
-        pd_signal += np.abs(c_nm)**2 * np.abs(H_nm)**2
+    # PD signal = sum_modes |c_nm|^2 |H_nm|^2
+    abs_c2 = (np.abs(c_nm)**2)[:, None]            # [Nmodes, 1]
+    abs_H2 = np.abs(H_nm_scan)**2                  # [Nmodes, Nscan]
+    pd_signal = np.sum(abs_c2 * abs_H2, axis=0)    # [Nscan]
 
     # --- FAST-DITHER CAMERA: TIME-AVERAGED INTENSITY ---
+    camera_img = np.zeros((Ny, Nx), dtype=float)
 
-    camera_img = np.zeros_like(X, dtype=float)
+    # Precompute for speed
+    # shapes: c_nm [Nmodes], H_nm_scan [Nmodes, Nscan], modes_nm [Nmodes, Ny, Nx]
+    for i in range(Nscan):
+        # weights for this scan index
+        weights = c_nm * H_nm_scan[:, i]  # [Nmodes]
 
-    for i in range(len(dL)):
-        E_inst = np.zeros_like(X, dtype=complex)
-
-        for (n, m), c_nm in coeffs.items():
-            h_nm = H_nm_dict[(n, m)][i]
-            E_inst += c_nm * h_nm * modes[(n, m)]
+        # E_inst(y,x) = sum_modes weights[m] * modes_nm[m, :, :]
+        # Use tensordot to do sum over modes in C (fast)
+        E_inst = np.tensordot(weights, modes_nm, axes=(0, 0))  # [Ny, Nx]
 
         camera_img += np.abs(E_inst)**2
 
-    camera_img /= len(dL)   # time average
+    camera_img /= Nscan  # time average
 
     return dL, pd_signal, camera_img, x, y
+
 
 ###############################################################################
 # Interactive plotting
@@ -243,6 +358,7 @@ if __name__ == "__main__":
         scan_range_lambda=init_scan_range_lam,
         Nmax=init_Nmax
     )
+
 
     # Figure with camera + PD
     fig, (ax_cam, ax_pd) = plt.subplots(1, 2, figsize=(10, 4))
@@ -306,11 +422,13 @@ if __name__ == "__main__":
     )
 
     def update(val):
+        # Get slider values
         x_off_um = s_xoff.val
         y_off_um = s_yoff.val
         scan_range_lambda = s_scan.val
         Nmax_int = int(s_Nmax.val)
 
+        # Re-run simulation with new parameters
         dL_new, pd_new, cam_new, x_new, y_new = simulate_cavity_camera_pd(
             R=R,
             L=L,
@@ -324,18 +442,21 @@ if __name__ == "__main__":
             FOV_factor=FOV_factor,
             Nscan=Nscan,
             scan_range_lambda=scan_range_lambda,
-            Nmax=Nmax_int
+            Nmax=Nmax_int,
         )
 
+        # Update PD plot
         line_pd.set_xdata(dL_new * 1e9)
         line_pd.set_ydata(pd_new)
         ax_pd.relim()
         ax_pd.autoscale_view()
 
+        # Update camera
         im.set_data(cam_new)
         im.set_clim(vmin=cam_new.min(), vmax=cam_new.max())
 
         fig.canvas.draw_idle()
+
 
     s_xoff.on_changed(update)
     s_yoff.on_changed(update)
