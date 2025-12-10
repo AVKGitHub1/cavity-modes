@@ -10,10 +10,10 @@ logger = logging.getLogger(__name__)
 
 from config import CONFIG  # import all tunable parameters
 
-
 # Global cache for HG modes & grid
 _HG_CACHE = {}
 
+USE_NUMBA = False
 ###############################################################################
 # Physics helpers
 ###############################################################################
@@ -193,7 +193,6 @@ def cavity_transfer_function(phi, r1, r2, t1, t2):
 ###############################################################################
 # Core simulation: nondegenerate HG modes
 ###############################################################################
-
 def simulate_cavity_camera_pd(
     R,
     L,
@@ -209,24 +208,12 @@ def simulate_cavity_camera_pd(
     scan_range_lambda,
     Nmax,
 ):
-    """
-    Nondegenerate symmetric cavity with HG_nm modes up to Nmax,
-    using cached 1D HG basis and 1D overlaps.
-
-    Returns:
-        dL         : cavity length change array [m]
-        pd_signal  : PD signal vs dL (arb. units)
-        camera_img : 2D time-averaged intensity [fast-dither regime]
-        x, y       : coordinate vectors [m]
-    """
     k = 2 * np.pi / lam
 
-    # Get grid and 1D HG basis from cache
-    (
-        x, y,
-        u_nx, u_my,
-        dx, dy,
-        g, z_R, w0_cav, z_m, w_m, R_m
+    (x, y,
+     u_nx, u_my,
+     dx, dy,
+     g, z_R, w0_cav, z_m, w_m, R_m
     ) = get_grid_and_1d_modes(R, L, lam, w0_in, Npix, FOV_factor, Nmax)
 
     Nn = Nmax + 1
@@ -234,11 +221,9 @@ def simulate_cavity_camera_pd(
     Nx = x.size
     Ny = y.size
 
-    # Input field 1D along x and y
     f_x = gaussian_field_1d(x, w0_in, Rb_in, lam, x0=x_off)
     f_y = gaussian_field_1d(y, w0_in, Rb_in, lam, x0=y_off)
 
-    # 1D overlaps: alpha_n = <u_nx | f_x>, beta_m = <u_my | f_y>
     alpha = np.zeros(Nn, dtype=complex)
     beta  = np.zeros(Nm, dtype=complex)
 
@@ -247,74 +232,60 @@ def simulate_cavity_camera_pd(
     for m in range(Nm):
         beta[m]  = np.sum(np.conjugate(u_my[m, :]) * f_y) * dy
 
-    # 2D mode overlaps: c_nm = alpha_n * beta_m (separable input!)
-    # Flatten to a 1D list of modes
     c_nm_2d = alpha[:, None] * beta[None, :]
     Nmodes = Nn * Nm
-
     c_nm = c_nm_2d.reshape(Nmodes)
 
-    # Build 2D HG modes (vectorized, via outer products of 1D basis)
-    # modes_nm[mode_index, j, k] = u_nx[n,k] * u_my[m,j]
-    modes_nm = np.zeros((Nmodes, Ny, Nx), dtype=complex)
+    # Build 2D HG modes
+    modes_nm = np.zeros((Nmodes, Ny, Nx), dtype=np.complex128)
     mode_index = 0
     for n in range(Nn):
         for m in range(Nm):
-            # outer product: y-index (rows), x-index (cols)
             modes_nm[mode_index, :, :] = np.outer(u_my[m, :], u_nx[n, :])
             mode_index += 1
 
-    # Gouy phase and nondegenerate resonance shifts
-    zeta = np.arccos(g)  # Gouy per half round trip
-
-    # Indices n,m for each flat mode index
+    zeta = np.arccos(g)
     n_indices = np.repeat(np.arange(Nn), Nm)
     m_indices = np.tile(np.arange(Nm), Nn)
     order_sum = n_indices + m_indices
+    deltaL_modes = -(order_sum.astype(float) * zeta / k)
 
-    # Mode-specific resonance length shift ΔL_nm
-    deltaL_modes = -(order_sum.astype(float) * zeta / k)  # [Nmodes]
-
-    # Cavity length scan
     dL = np.linspace(-scan_range_lambda * lam,
-                     +scan_range_lambda * lam, Nscan)  # [Nscan]
+                     +scan_range_lambda * lam, Nscan)
 
-    # Mirror amplitude coefficients
     r1 = np.sqrt(Rmirror)
     r2 = np.sqrt(Rmirror)
     t1 = np.sqrt(1 - Rmirror)
     t2 = np.sqrt(1 - Rmirror)
 
-    # Build array of detunings for each mode and scan point
-    # shape: [Nmodes, Nscan]
     dL_matrix = dL[None, :] - deltaL_modes[:, None]
     phi_nm = 2 * k * dL_matrix
 
-    # Field transfer function for all modes and scan points
     denom = 1 - r1 * r2 * np.exp(1j * phi_nm)
     H_nm_scan = t1 * t2 * np.exp(1j * phi_nm / 2) / denom  # [Nmodes, Nscan]
 
-    # PD signal = sum_modes |c_nm|^2 |H_nm|^2
-    abs_c2 = (np.abs(c_nm)**2)[:, None]            # [Nmodes, 1]
-    abs_H2 = np.abs(H_nm_scan)**2                  # [Nmodes, Nscan]
-    pd_signal = np.sum(abs_c2 * abs_H2, axis=0)    # [Nscan]
+    # PD signal (already pretty vectorized)
+    abs_c2 = (np.abs(c_nm) ** 2)[:, None]   # [Nmodes, 1]
+    abs_H2 = np.abs(H_nm_scan) ** 2         # [Nmodes, Nscan]
+    pd_signal = np.sum(abs_c2 * abs_H2, axis=0)
 
-    # --- FAST-DITHER CAMERA: TIME-AVERAGED INTENSITY ---
-    camera_img = np.zeros((Ny, Nx), dtype=float)
+    # ----- Camera signal: fully vectorized using BLAS -----
+    # Flatten spatial dimensions: modes_nm [Nmodes, Ny, Nx] -> [Nmodes, Np]
+    Nmodes = c_nm.size
+    Np = Ny * Nx
+    modes_flat = modes_nm.reshape(Nmodes, Np)        # [Nmodes, Np]
 
-    # Precompute for speed
-    # shapes: c_nm [Nmodes], H_nm_scan [Nmodes, Nscan], modes_nm [Nmodes, Ny, Nx]
-    for i in range(Nscan):
-        # weights for this scan index
-        weights = c_nm * H_nm_scan[:, i]  # [Nmodes]
+    # Weights for each mode and scan: W_k,i = c_k * H_k(i)
+    weights = c_nm[:, None] * H_nm_scan             # [Nmodes, Nscan]
 
-        # E_inst(y,x) = sum_modes weights[m] * modes_nm[m, :, :]
-        # Use tensordot to do sum over modes in C (fast)
-        E_inst = np.tensordot(weights, modes_nm, axes=(0, 0))  # [Ny, Nx]
+    # E_flat[p, i] = sum_k modes_flat[k, p] * weights[k, i]
+    # This is a single big matmul in C/Fortran:
+    E_flat = modes_flat.T @ weights                  # [Np, Nscan]
 
-        camera_img += np.abs(E_inst)**2
+    # Intensity and average over scans
+    I_flat = np.abs(E_flat)**2                       # [Np, Nscan]
+    camera_img = I_flat.mean(axis=1).reshape(Ny, Nx) # [Ny, Nx]
 
-    camera_img /= Nscan  # time average
 
     return dL, pd_signal, camera_img, x, y
 
